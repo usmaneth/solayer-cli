@@ -1,0 +1,166 @@
+import * as anchor from "@coral-xyz/anchor";
+import { BN, web3 } from "@coral-xyz/anchor";
+import { readFileSync } from "fs";
+import { 
+    VersionedTransaction, 
+    Keypair, 
+    Connection,
+    ComputeBudgetProgram,
+    TransactionMessage,
+    VersionedMessage
+} from "@solana/web3.js";
+import { convertFromDecimalBN, loadKeypairFromFile } from "../utils/helpers";
+import axios from "axios";
+
+// Configuration
+const SOLAYER_ENDPOINT = "https://acc.solayer.org";
+const DEFAULT_COMPUTE_UNITS = 200_000; // Default compute units
+const COMPUTE_UNIT_PRICE = 1_000; // Adjust as needed
+
+/**
+ * Enhanced server transaction fetcher with fallback and retry logic
+ */
+async function getServerTx(
+    account: web3.PublicKey, 
+    amount: string, 
+    referrerKey: string,
+    retries = 3
+): Promise<any> {
+    const params = new URLSearchParams({
+        staker: account.toString(),
+        amount: amount,
+        referrerkey: referrerKey
+    });
+
+    for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+            const response = await fetch(
+                `https://app.solayer.org/api/partner/restake/ssol?${params}`,
+                {
+                    method: 'get',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data?.message || 'Server error');
+            }
+            return data;
+        } catch (e) {
+            if (attempt === retries - 1) throw e;
+            await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+        }
+    }
+}
+
+/**
+ * Creates a compute budget instruction to double compute units
+ */
+function createComputeBudgetIx() {
+    return ComputeBudgetProgram.setComputeUnitLimit({
+        units: DEFAULT_COMPUTE_UNITS * 2
+    });
+}
+
+/**
+ * Enhanced staking function with Alchemy support and optimized broadcasting
+ * @param providerUrl Alchemy RPC URL
+ * @param keyPairPath Path to keypair file
+ * @param amount SOL amount to stake
+ * @param referrer Referrer's wallet address
+ */
+export async function enhancedStake(
+    providerUrl: string,
+    keyPairPath: string,
+    amount: string,
+    referrer: string
+) {
+    // Setup connection with Alchemy
+    const connection = new Connection(providerUrl, {
+        commitment: "confirmed",
+        confirmTransactionInitialTimeout: 60000
+    });
+
+    const keypair = new anchor.Wallet(
+        Keypair.fromSecretKey(
+            new Uint8Array(JSON.parse(readFileSync(keyPairPath).toString()))
+        )
+    );
+    const provider = new anchor.AnchorProvider(connection, keypair, {});
+    anchor.setProvider(provider);
+
+    // Balance check
+    const decimals = 9;
+    const balance = await connection.getBalance(provider.publicKey);
+    if (new BN(balance).lt(convertFromDecimalBN(amount, decimals))) {
+        throw Error(`Insufficient balance for staking ${amount} SOL`);
+    }
+
+    try {
+        // Get transaction data
+        const data = await getServerTx(provider.publicKey, amount, referrer);
+        console.log('Transaction data received:', data);
+
+        // Prepare and sign transaction
+        const wallet = loadKeypairFromFile(keyPairPath);
+        const txDataBuffer = Buffer.from(data['transaction'], 'base64');
+        let transaction = VersionedTransaction.deserialize(Uint8Array.from(txDataBuffer));
+
+        // Add compute budget instruction for doubled compute units
+        const computeBudgetIx = createComputeBudgetIx();
+        const messageV0 = transaction.message as VersionedMessage;
+        const newMessage = new TransactionMessage({
+            payerKey: wallet.publicKey,
+            recentBlockhash: messageV0.recentBlockhash,
+            instructions: [computeBudgetIx, ...messageV0.compiledInstructions]
+        }).compileToV0Message();
+
+        transaction = new VersionedTransaction(newMessage);
+        transaction.sign([wallet]);
+
+        console.log('Sending transaction with doubled compute units');
+
+        // Broadcast to both endpoints for redundancy
+        const tx = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: true,
+            maxRetries: 5
+        });
+
+        // Broadcast to Solayer's optimized endpoint
+        try {
+            const solayerBody = {
+                jsonrpc: "2.0",
+                method: "sendTransaction",
+                id: 1,
+                params: [tx]
+            };
+            
+            const response = await axios.post(SOLAYER_ENDPOINT, solayerBody);
+            console.log('Solayer broadcast response:', response.data);
+            
+            // Wait for confirmation
+            const confirmation = await connection.confirmTransaction({
+                signature: tx,
+                blockhash: newMessage.recentBlockhash,
+                lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight
+            });
+            
+            console.log('Transaction confirmed:', {
+                signature: tx,
+                confirmationStatus: confirmation.value.confirmationStatus
+            });
+            
+            return tx;
+        } catch (error) {
+            console.error('Solayer broadcast error:', error.response?.data || error);
+            // Transaction might still succeed through regular RPC
+            return tx;
+        }
+    } catch (e) {
+        console.error('Staking error:', e);
+        throw new Error(`Staking failed: ${e.message}`);
+    }
+}
